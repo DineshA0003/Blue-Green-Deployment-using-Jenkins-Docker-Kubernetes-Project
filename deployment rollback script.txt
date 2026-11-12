@@ -1,0 +1,280 @@
+@echo off
+setlocal EnableExtensions
+
+echo.
+echo ==================================================
+echo       BLUE GREEN DEPLOYMENT AUTOMATION
+echo          WITH AUTOMATED ROLLBACK
+echo ==================================================
+
+REM ==================================================
+REM STEP 1: CONFIGURATION
+REM ==================================================
+
+set "PATH=C:\Program Files\Docker\Docker\resources\bin;C:\Program Files\Kubernetes\Minikube;C:\Program Files\Git\cmd;%PATH%"
+
+set "DOCKER=C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+set "KUBECTL=C:\Program Files\Docker\Docker\resources\bin\kubectl.exe"
+set "MINIKUBE=C:\Program Files\Kubernetes\Minikube\minikube.exe"
+
+set "MINIKUBE_HOME=C:\Users\dines\.minikube"
+set "KUBECONFIG=C:\Users\dines\.kube\config"
+
+set "IMAGE=blue-green-app:%BUILD_NUMBER%"
+set "APP_DIR=%WORKSPACE%"
+
+cd /d "%APP_DIR%"
+
+if errorlevel 1 exit /b 1
+
+echo Docker Image: %IMAGE%
+echo Workspace: %WORKSPACE%
+
+REM ==================================================
+REM STEP 2: CHECK DOCKER
+REM ==================================================
+
+echo.
+echo STEP 2: CHECK DOCKER CONNECTION
+echo.
+
+"%DOCKER%" version
+
+if errorlevel 1 (
+    echo ERROR: Docker is not running.
+    exit /b 1
+)
+
+REM ==================================================
+REM STEP 3: CHECK MINIKUBE AND KUBERNETES
+REM ==================================================
+
+echo.
+echo STEP 3: CHECK KUBERNETES CONNECTION
+echo.
+
+"%MINIKUBE%" status
+
+if errorlevel 1 (
+    echo ERROR: Minikube is not running.
+    exit /b 1
+)
+
+"%KUBECTL%" get nodes
+
+if errorlevel 1 (
+    echo ERROR: Kubernetes connection failed.
+    exit /b 1
+)
+
+REM ==================================================
+REM STEP 4: BUILD DOCKER IMAGE
+REM ==================================================
+
+echo.
+echo STEP 4: BUILD DOCKER IMAGE
+echo.
+
+"%DOCKER%" build -t %IMAGE% .
+
+if errorlevel 1 (
+    echo ERROR: Docker image build failed.
+    exit /b 1
+)
+
+REM ==================================================
+REM STEP 5: LOAD IMAGE INTO MINIKUBE
+REM ==================================================
+
+echo.
+echo STEP 5: LOAD IMAGE INTO MINIKUBE
+echo.
+
+"%MINIKUBE%" image load %IMAGE%
+
+if errorlevel 1 (
+    echo ERROR: Image loading failed.
+    exit /b 1
+)
+
+REM ==================================================
+REM STEP 6: CHECK CURRENT PRODUCTION VERSION
+REM ==================================================
+
+echo.
+echo STEP 6: CHECK CURRENT PRODUCTION VERSION
+echo.
+
+"%KUBECTL%" get service production-service -o "jsonpath={.spec.selector.version}" > "%WORKSPACE%\active-version.txt"
+
+if errorlevel 1 (
+    echo ERROR: Cannot read production service selector.
+    exit /b 1
+)
+
+set /p ACTIVE_VERSION=<"%WORKSPACE%\active-version.txt"
+
+echo Current Production Version: %ACTIVE_VERSION%
+
+REM ==================================================
+REM STEP 7: SELECT INACTIVE DEPLOYMENT
+REM ==================================================
+
+echo.
+echo STEP 7: SELECT TARGET DEPLOYMENT
+echo.
+
+if /I "%ACTIVE_VERSION%"=="blue" (
+    set "TARGET_VERSION=green"
+    set "TARGET_DEPLOYMENT=green-deployment"
+    set "TARGET_CONTAINER=green-app"
+) else if /I "%ACTIVE_VERSION%"=="green" (
+    set "TARGET_VERSION=blue"
+    set "TARGET_DEPLOYMENT=blue-deployment"
+    set "TARGET_CONTAINER=blue-app"
+) else (
+    echo ERROR: Unknown production version.
+    exit /b 1
+)
+
+echo Active Version: %ACTIVE_VERSION%
+echo Target Version: %TARGET_VERSION%
+echo Target Deployment: %TARGET_DEPLOYMENT%
+
+REM ==================================================
+REM STEP 8: SAVE CURRENT IMAGE FOR ROLLBACK
+REM ==================================================
+
+echo.
+echo STEP 8: SAVE PREVIOUS IMAGE
+echo.
+
+"%KUBECTL%" get deployment %TARGET_DEPLOYMENT% -o "jsonpath={.spec.template.spec.containers[0].image}" > "%WORKSPACE%\previous-image.txt"
+
+if errorlevel 1 (
+    echo ERROR: Could not retrieve previous image.
+    exit /b 1
+)
+
+set /p PREVIOUS_IMAGE=<"%WORKSPACE%\previous-image.txt"
+
+echo Previous Image: %PREVIOUS_IMAGE%
+echo New Image: %IMAGE%
+
+REM ==================================================
+REM STEP 9: UPDATE INACTIVE DEPLOYMENT
+REM ==================================================
+
+echo.
+echo STEP 9: UPDATE TARGET DEPLOYMENT
+echo.
+
+"%KUBECTL%" set image deployment/%TARGET_DEPLOYMENT% %TARGET_CONTAINER%=%IMAGE%
+
+if errorlevel 1 goto ROLLBACK
+
+REM ==================================================
+REM STEP 10: WAIT FOR ROLLOUT
+REM ==================================================
+
+echo.
+echo STEP 10: WAIT FOR DEPLOYMENT ROLLOUT
+echo.
+
+"%KUBECTL%" rollout status deployment/%TARGET_DEPLOYMENT% --timeout=180s
+
+if errorlevel 1 goto ROLLBACK
+
+REM ==================================================
+REM STEP 11: APPLICATION HEALTH CHECK
+REM ==================================================
+
+echo.
+echo STEP 11: APPLICATION HEALTH CHECK
+echo.
+
+"%KUBECTL%" exec deployment/%TARGET_DEPLOYMENT% -- python -c "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:5000/health',timeout=5); print(r.read().decode())"
+
+if errorlevel 1 goto ROLLBACK
+
+REM ==================================================
+REM STEP 12: SWITCH PRODUCTION TRAFFIC
+REM ==================================================
+
+echo.
+echo STEP 12: SWITCH PRODUCTION TRAFFIC
+echo.
+
+"%KUBECTL%" set selector service/production-service app=blue-green-app,version=%TARGET_VERSION%
+
+if errorlevel 1 goto ROLLBACK
+
+REM ==================================================
+REM STEP 13: VERIFY PRODUCTION
+REM ==================================================
+
+echo.
+echo STEP 13: VERIFY PRODUCTION ENDPOINTS
+echo.
+
+"%KUBECTL%" get endpoints production-service
+
+if errorlevel 1 (
+    echo WARNING: Unable to read production endpoints.
+    exit /b 1
+)
+
+"%KUBECTL%" get pods -o wide
+
+echo.
+echo ==================================================
+echo       BLUE GREEN DEPLOYMENT SUCCESSFUL
+echo       PRODUCTION VERSION: %TARGET_VERSION%
+echo ==================================================
+
+exit /b 0
+
+
+REM ==================================================
+REM AUTOMATED ROLLBACK
+REM ==================================================
+
+:ROLLBACK
+
+echo.
+echo ==================================================
+echo          AUTOMATED ROLLBACK STARTED
+echo ==================================================
+
+echo.
+echo Deployment Failed!
+echo Restoring Previous Image: %PREVIOUS_IMAGE%
+
+REM Restore previous image explicitly
+
+"%KUBECTL%" set image deployment/%TARGET_DEPLOYMENT% %TARGET_CONTAINER%=%PREVIOUS_IMAGE%
+
+if errorlevel 1 (
+    echo ERROR: Previous image restoration failed.
+    exit /b 1
+)
+
+REM Wait for previous deployment to become healthy
+
+"%KUBECTL%" rollout status deployment/%TARGET_DEPLOYMENT% --timeout=180s
+
+if errorlevel 1 (
+    echo ERROR: Rollback rollout failed.
+    exit /b 1
+)
+
+echo.
+echo ==================================================
+echo             ROLLBACK COMPLETED
+echo ==================================================
+
+echo Production traffic remains on %ACTIVE_VERSION%.
+
+"%KUBECTL%" get endpoints production-service
+
+exit /b 1

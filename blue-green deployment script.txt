@@ -1,0 +1,104 @@
+@echo off
+setlocal EnableExtensions
+
+echo ==========================================
+echo STEP 1: CONFIGURATION
+echo ==========================================
+
+set "PATH=C:\Program Files\Docker\Docker\resources\bin;C:\Program Files\Kubernetes\Minikube;%PATH%"
+
+set "DOCKER=C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+set "KUBECTL=C:\Program Files\Docker\Docker\resources\bin\kubectl.exe"
+set "MINIKUBE=C:\Program Files\Kubernetes\Minikube\minikube.exe"
+
+set "MINIKUBE_HOME=C:\Users\dines\.minikube"
+set "KUBECONFIG=C:\Users\dines\.kube\config"
+
+set "IMAGE=blue-green-app:%BUILD_NUMBER%"
+
+echo Docker Image: %IMAGE%
+
+echo ==========================================
+echo STEP 2: CHECK DOCKER
+echo ==========================================
+
+"%DOCKER%" version
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 3: CHECK KUBERNETES
+echo ==========================================
+
+"%KUBECTL%" get nodes
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 4: BUILD DOCKER IMAGE
+echo ==========================================
+
+"%DOCKER%" build -t %IMAGE% .
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 5: LOAD IMAGE INTO MINIKUBE
+echo ==========================================
+
+"%MINIKUBE%" image load %IMAGE%
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 6: APPLY GREEN DEPLOYMENT
+echo ==========================================
+
+cd /d "%WORKSPACE%"
+
+"%KUBECTL%" apply -f kubernetes\green-deployment.yaml
+if errorlevel 1 exit /b 1
+
+"%KUBECTL%" apply -f kubernetes\green-preview-service.yaml
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 7: UPDATE GREEN IMAGE
+echo ==========================================
+
+"%KUBECTL%" set image deployment/green-deployment green-app=%IMAGE%
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 8: WAIT FOR GREEN DEPLOYMENT
+echo ==========================================
+
+"%KUBECTL%" rollout status deployment/green-deployment --timeout=180s
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 9: GREEN APPLICATION HEALTH CHECK
+echo ==========================================
+
+"%KUBECTL%" exec deployment/green-deployment -- python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/health',timeout=5).read().decode())"
+
+if errorlevel 1 (
+    echo GREEN HEALTH CHECK FAILED
+    echo PRODUCTION TRAFFIC NOT CHANGED
+    exit /b 1
+)
+
+echo ==========================================
+echo STEP 10: SWITCH PRODUCTION TO GREEN
+echo ==========================================
+
+"%KUBECTL%" set selector service/production-service app=blue-green-app,version=green
+if errorlevel 1 exit /b 1
+
+echo ==========================================
+echo STEP 11: VERIFY PRODUCTION ENDPOINTS
+echo ==========================================
+
+"%KUBECTL%" get endpoints production-service
+
+echo ==========================================
+echo BLUE GREEN DEPLOYMENT SUCCESSFUL
+echo ==========================================
+
+exit /b 0
